@@ -1,0 +1,75 @@
+# K+ — Pré-contrôle KVM sur un runner GitHub Actions (DIAGNOSTIC LECTURE SEULE)
+# Destination : .github/workflows/kvm-precheck.yml d'un dépôt K+ distinct de KeyLora.
+# Déclenchement MANUEL uniquement. Aucune installation, aucune VM, aucun secret.
+name: kvm-precheck
+
+on:
+  workflow_dispatch: {}      # MANUEL seulement — pas de push, pas de pull_request, pas de schedule
+
+permissions:
+  contents: read             # lecture seule ; aucune écriture sur le dépôt
+
+jobs:
+  kvm-precheck:
+    runs-on: ubuntu-24.04    # runner hébergé STANDARD (surtout pas ubuntu-slim)
+    timeout-minutes: 5       # borne dure les minutes consommées
+    steps:
+      - name: Contexte du runner
+        run: |
+          echo "=== runner / image ==="
+          echo "runner.os=${{ runner.os }}  runner.arch=${{ runner.arch }}"
+          echo "ImageOS=$ImageOS  ImageVersion=$ImageVersion"
+          uname -a
+          echo "utilisateur: $(id)"
+          echo "groupes: $(id -nG)"
+
+      - name: Présence et permissions de /dev/kvm (lecture seule)
+        run: |
+          echo "=== /dev/kvm ==="
+          ls -l /dev/kvm 2>&1 || echo "ABSENT"
+          echo "=== accès effectif SANS sudo ==="
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then echo "RW_OK"; else echo "RW_NON"; fi
+          echo "=== appartenance au groupe kvm ==="
+          if id -nG | tr ' ' '\n' | grep -qx kvm; then echo "dans_groupe_kvm=oui"; else echo "dans_groupe_kvm=non"; fi
+
+      - name: Flags de virtualisation et modules (lecture seule)
+        run: |
+          echo "=== flags CPU (vmx=Intel, svm=AMD) ==="
+          grep -oE 'vmx|svm' /proc/cpuinfo | sort -u | tr '\n' ' '; echo "(vide = non exposés)"
+          echo "=== modules kvm chargés ==="
+          lsmod | grep -E '^kvm' || echo "aucun module kvm listé"
+
+      - name: Vérification MINIMALE de l'API KVM (ouvre /dev/kvm + KVM_GET_API_VERSION ; AUCUNE VM créée)
+        run: |
+          # Distingue un périphérique seulement VISIBLE d'un périphérique réellement ACCESSIBLE.
+          # KVM_GET_API_VERSION = _IO(0xAE, 0x00) = 0xAE00. Ne crée NI ne démarre aucune VM.
+          # python3 est préinstallé sur le runner (aucune installation).
+          python3 - <<'PY' | tee "$RUNNER_TEMP/kvm_api.txt"
+          import os, fcntl, sys
+          try:
+              fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
+          except OSError as e:
+              print(f"KVM_OPEN_FAIL errno={e.errno} ({e.strerror})")
+              sys.exit(0)
+          try:
+              ver = fcntl.ioctl(fd, 0xAE00, 0)   # KVM_GET_API_VERSION
+              print(f"KVM_API_VERSION={ver}")
+              print("KVM_API_OK" if ver == 12 else f"KVM_API_UNEXPECTED={ver}")
+          except OSError as e:
+              print(f"KVM_IOCTL_FAIL errno={e.errno} ({e.strerror})")
+          finally:
+              os.close(fd)
+          PY
+
+      - name: VERDICT
+        run: |
+          api_ok=no
+          grep -q "KVM_API_OK" "$RUNNER_TEMP/kvm_api.txt" 2>/dev/null && api_ok=yes
+          echo "api_ok=$api_ok"
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ] && grep -qE 'vmx|svm' /proc/cpuinfo && [ "$api_ok" = yes ]; then
+            echo "VERDICT=KVM_UTILISABLE"
+          elif [ -e /dev/kvm ]; then
+            echo "VERDICT=INDETERMINE (present mais acces, flags ou API incomplets)"
+          else
+            echo "VERDICT=KVM_ABSENT_OU_INACCESSIBLE"
+          fi
