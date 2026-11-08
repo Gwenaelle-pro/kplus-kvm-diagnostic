@@ -1,8 +1,9 @@
-# K+ — Pré-contrôle KVM sur un runner GitHub Actions (DIAGNOSTIC LECTURE SEULE)
+# K+ — Pré-contrôle KVM_CREATE_VM sur un runner GitHub Actions (DIAGNOSTIC)
 # Destination : .github/workflows/kvm-precheck.yml du dépôt public Gwenaelle-pro/kplus-kvm-diagnostic.
-# Déclenchement MANUEL uniquement. Aucune installation, aucune VM, aucun secret.
-# v3 : ajoute un second sondage de l'API KVM AVEC sudo (requête de version seulement),
-#      SANS modifier les permissions de /dev/kvm, SANS usermod, SANS création de VM.
+# Déclenchement MANUEL uniquement. AUCUN téléchargement, AUCUNE installation, AUCUN Firecracker.
+# v4 : teste si la virtualisation imbriquée permet de CRÉER un objet VM KVM (KVM_CREATE_VM),
+#      PUIS le ferme immédiatement. SANS vCPU, SANS mémoire invité, SANS disque, SANS réseau,
+#      SANS démarrage d'invité. SANS modifier les permissions de /dev/kvm.
 name: kvm-precheck
 
 on:
@@ -18,71 +19,56 @@ jobs:
     steps:
       - name: Contexte du runner
         run: |
-          echo "=== runner / image ==="
-          echo "runner.os=${{ runner.os }}  runner.arch=${{ runner.arch }}"
           echo "ImageOS=$ImageOS  ImageVersion=$ImageVersion"
           uname -a
           echo "utilisateur: $(id)"
-          echo "groupes: $(id -nG)"
+          ls -l /dev/kvm 2>&1 || echo "/dev/kvm ABSENT"
 
-      - name: Présence et permissions de /dev/kvm (lecture seule)
+      - name: Écrire le script de sondage (fichier local ; n'exécute rien tant qu'il n'est pas appelé)
         run: |
-          echo "=== /dev/kvm ==="
-          ls -l /dev/kvm 2>&1 || echo "ABSENT"
-          echo "=== accès effectif SANS sudo ==="
-          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then echo "RW_OK"; else echo "RW_NON"; fi
-          echo "=== appartenance au groupe kvm ==="
-          if id -nG | tr ' ' '\n' | grep -qx kvm; then echo "dans_groupe_kvm=oui"; else echo "dans_groupe_kvm=non"; fi
-
-      - name: Flags de virtualisation et modules (lecture seule)
-        run: |
-          echo "=== flags CPU (vmx=Intel, svm=AMD) ==="
-          grep -oE 'vmx|svm' /proc/cpuinfo | sort -u | tr '\n' ' '; echo "(vide = non exposés)"
-          echo "=== modules kvm chargés ==="
-          lsmod | grep -E '^kvm' || echo "aucun module kvm listé"
-
-      - name: Écrire le script de sondage API (fichier local ; n'exécute rien sur KVM)
-        run: |
-          # KVM_GET_API_VERSION = _IO(0xAE, 0x00) = 0xAE00. Requête de VERSION uniquement :
-          # ne crée NI ne démarre aucune VM, ne modifie AUCUNE permission.
-          cat > "$RUNNER_TEMP/kvm_api.py" <<'PY'
+          # KVM_GET_API_VERSION = _IO(0xAE,0x00)=0xAE00 ; KVM_CREATE_VM = _IO(0xAE,0x01)=0xAE01.
+          # KVM_CREATE_VM alloue un OBJET VM dans le noyau et renvoie un nouveau descripteur.
+          # On le FERME aussitôt. AUCUN vCPU (KVM_CREATE_VCPU non appelé), AUCUNE région mémoire,
+          # AUCUN KVM_RUN : aucun système invité ne démarre.
+          cat > "$RUNNER_TEMP/kvm_create.py" <<'PY'
           import os, fcntl, sys
+          KVM_GET_API_VERSION = 0xAE00
+          KVM_CREATE_VM       = 0xAE01
           try:
               fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
           except OSError as e:
               print(f"KVM_OPEN_FAIL errno={e.errno} ({e.strerror})"); sys.exit(0)
           try:
-              ver = fcntl.ioctl(fd, 0xAE00, 0)   # KVM_GET_API_VERSION
+              ver = fcntl.ioctl(fd, KVM_GET_API_VERSION, 0)
               print(f"KVM_API_VERSION={ver}")
-              print("KVM_API_OK" if ver == 12 else f"KVM_API_UNEXPECTED={ver}")
-          except OSError as e:
-              print(f"KVM_IOCTL_FAIL errno={e.errno} ({e.strerror})")
+              try:
+                  vmfd = fcntl.ioctl(fd, KVM_CREATE_VM, 0)   # crée l'objet VM (type 0)
+                  if isinstance(vmfd, int) and vmfd >= 0:
+                      print(f"KVM_CREATE_VM_OK vm_fd={vmfd}")
+                      os.close(vmfd)                          # fermeture IMMÉDIATE de l'objet VM
+                      print("KVM_VM_CLOSED")
+                  else:
+                      print(f"KVM_CREATE_VM_UNEXPECTED ret={vmfd}")
+              except OSError as e:
+                  print(f"KVM_CREATE_VM_FAIL errno={e.errno} ({e.strerror})")
           finally:
               os.close(fd)
           PY
 
-      - name: API KVM SANS privilège (utilisateur runner)
+      - name: Sondage KVM_CREATE_VM AVEC sudo (requête noyau seulement ; AUCUN chmod/usermod, AUCUN invité)
         run: |
-          python3 "$RUNNER_TEMP/kvm_api.py" | tee "$RUNNER_TEMP/kvm_user.txt"
-
-      - name: API KVM AVEC sudo (requête de version seulement ; AUCUN chmod/usermod, AUCUNE VM)
-        run: |
-          # sudo est sans mot de passe sur les runners GitHub. On interroge SEULEMENT la
-          # version de l'API ; on ne modifie pas /dev/kvm, on n'ajoute personne au groupe kvm.
-          sudo python3 "$RUNNER_TEMP/kvm_api.py" | tee "$RUNNER_TEMP/kvm_sudo.txt"
+          # sudo sans mot de passe sur les runners GitHub. On ne modifie AUCUNE permission.
+          sudo python3 "$RUNNER_TEMP/kvm_create.py" | tee "$RUNNER_TEMP/kvm_create.txt"
 
       - name: VERDICT
         run: |
-          user_ok=no; sudo_ok=no
-          grep -q "KVM_API_OK" "$RUNNER_TEMP/kvm_user.txt" 2>/dev/null && user_ok=yes
-          grep -q "KVM_API_OK" "$RUNNER_TEMP/kvm_sudo.txt" 2>/dev/null && sudo_ok=yes
-          echo "api_sans_privilege=$user_ok  api_avec_sudo=$sudo_ok"
-          if [ "$user_ok" = yes ]; then
-            echo "VERDICT=KVM_UTILISABLE_SANS_PRIVILEGE"
-          elif [ "$sudo_ok" = yes ]; then
-            echo "VERDICT=KVM_UTILISABLE_AVEC_SUDO (API OK en root ; acces non-root securise RESTE a etablir pour Firecracker)"
-          elif [ -e /dev/kvm ]; then
-            echo "VERDICT=INDETERMINE (present mais API inaccessible meme avec sudo)"
+          f="$RUNNER_TEMP/kvm_create.txt"
+          if grep -q "KVM_VM_CLOSED" "$f" 2>/dev/null; then
+            echo "VERDICT=NESTED_KVM_CREATE_VM_OK"
+          elif grep -q "KVM_CREATE_VM_FAIL" "$f" 2>/dev/null; then
+            echo "VERDICT=NESTED_KVM_CREATE_VM_FAIL (virt imbriquee insuffisante pour creer une VM)"
+          elif grep -q "KVM_OPEN_FAIL" "$f" 2>/dev/null; then
+            echo "VERDICT=KVM_OPEN_FAIL (acces refuse meme avec sudo)"
           else
-            echo "VERDICT=KVM_ABSENT_OU_INACCESSIBLE"
+            echo "VERDICT=INDETERMINE"
           fi
