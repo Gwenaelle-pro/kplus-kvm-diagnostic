@@ -1,6 +1,8 @@
 # K+ — Pré-contrôle KVM sur un runner GitHub Actions (DIAGNOSTIC LECTURE SEULE)
-# Destination : .github/workflows/kvm-precheck.yml d'un dépôt K+ distinct de KeyLora.
+# Destination : .github/workflows/kvm-precheck.yml du dépôt public Gwenaelle-pro/kplus-kvm-diagnostic.
 # Déclenchement MANUEL uniquement. Aucune installation, aucune VM, aucun secret.
+# v3 : ajoute un second sondage de l'API KVM AVEC sudo (requête de version seulement),
+#      SANS modifier les permissions de /dev/kvm, SANS usermod, SANS création de VM.
 name: kvm-precheck
 
 on:
@@ -39,18 +41,16 @@ jobs:
           echo "=== modules kvm chargés ==="
           lsmod | grep -E '^kvm' || echo "aucun module kvm listé"
 
-      - name: Vérification MINIMALE de l'API KVM (ouvre /dev/kvm + KVM_GET_API_VERSION ; AUCUNE VM créée)
+      - name: Écrire le script de sondage API (fichier local ; n'exécute rien sur KVM)
         run: |
-          # Distingue un périphérique seulement VISIBLE d'un périphérique réellement ACCESSIBLE.
-          # KVM_GET_API_VERSION = _IO(0xAE, 0x00) = 0xAE00. Ne crée NI ne démarre aucune VM.
-          # python3 est préinstallé sur le runner (aucune installation).
-          python3 - <<'PY' | tee "$RUNNER_TEMP/kvm_api.txt"
+          # KVM_GET_API_VERSION = _IO(0xAE, 0x00) = 0xAE00. Requête de VERSION uniquement :
+          # ne crée NI ne démarre aucune VM, ne modifie AUCUNE permission.
+          cat > "$RUNNER_TEMP/kvm_api.py" <<'PY'
           import os, fcntl, sys
           try:
               fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
           except OSError as e:
-              print(f"KVM_OPEN_FAIL errno={e.errno} ({e.strerror})")
-              sys.exit(0)
+              print(f"KVM_OPEN_FAIL errno={e.errno} ({e.strerror})"); sys.exit(0)
           try:
               ver = fcntl.ioctl(fd, 0xAE00, 0)   # KVM_GET_API_VERSION
               print(f"KVM_API_VERSION={ver}")
@@ -61,15 +61,28 @@ jobs:
               os.close(fd)
           PY
 
+      - name: API KVM SANS privilège (utilisateur runner)
+        run: |
+          python3 "$RUNNER_TEMP/kvm_api.py" | tee "$RUNNER_TEMP/kvm_user.txt"
+
+      - name: API KVM AVEC sudo (requête de version seulement ; AUCUN chmod/usermod, AUCUNE VM)
+        run: |
+          # sudo est sans mot de passe sur les runners GitHub. On interroge SEULEMENT la
+          # version de l'API ; on ne modifie pas /dev/kvm, on n'ajoute personne au groupe kvm.
+          sudo python3 "$RUNNER_TEMP/kvm_api.py" | tee "$RUNNER_TEMP/kvm_sudo.txt"
+
       - name: VERDICT
         run: |
-          api_ok=no
-          grep -q "KVM_API_OK" "$RUNNER_TEMP/kvm_api.txt" 2>/dev/null && api_ok=yes
-          echo "api_ok=$api_ok"
-          if [ -r /dev/kvm ] && [ -w /dev/kvm ] && grep -qE 'vmx|svm' /proc/cpuinfo && [ "$api_ok" = yes ]; then
-            echo "VERDICT=KVM_UTILISABLE"
+          user_ok=no; sudo_ok=no
+          grep -q "KVM_API_OK" "$RUNNER_TEMP/kvm_user.txt" 2>/dev/null && user_ok=yes
+          grep -q "KVM_API_OK" "$RUNNER_TEMP/kvm_sudo.txt" 2>/dev/null && sudo_ok=yes
+          echo "api_sans_privilege=$user_ok  api_avec_sudo=$sudo_ok"
+          if [ "$user_ok" = yes ]; then
+            echo "VERDICT=KVM_UTILISABLE_SANS_PRIVILEGE"
+          elif [ "$sudo_ok" = yes ]; then
+            echo "VERDICT=KVM_UTILISABLE_AVEC_SUDO (API OK en root ; acces non-root securise RESTE a etablir pour Firecracker)"
           elif [ -e /dev/kvm ]; then
-            echo "VERDICT=INDETERMINE (present mais acces, flags ou API incomplets)"
+            echo "VERDICT=INDETERMINE (present mais API inaccessible meme avec sudo)"
           else
             echo "VERDICT=KVM_ABSENT_OU_INACCESSIBLE"
           fi
